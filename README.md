@@ -36,5 +36,6 @@ It allows users to **enter any website URL**, automatically **fetch its content*
 
 1️⃣ Clone this repository
 git clone https://github.com/PS-Unnati-Parmar/rag-chatbot.git
-cd rag-chatbot
+
+
 
