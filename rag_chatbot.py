@@ -2,12 +2,13 @@ import os
 import streamlit as st
 import requests
 from dotenv import load_dotenv
-import google.generativeai as genai
 from bs4 import BeautifulSoup
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
 
-# -------------------------------
-# 1. Load environment variables
-# -------------------------------
+# Load environment variables
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 
@@ -16,74 +17,110 @@ if not api_key:
     st.stop()
 
 genai.configure(api_key=api_key)
-
-# Initialize Gemini model
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
-# -------------------------------
-# 2. Helper functions
-# -------------------------------
+@st.cache_resource
+def get_embedder():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
-def crawl_website(url):
-    """Fetch and extract visible text content from a given URL."""
+embedding_model = get_embedder()
+
+def fast_crawl(url, timeout=7):
+    """Fetch only visible relevant text from main tags quickly."""
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # Extract readable text
-        for script in soup(["script", "style"]):
-            script.extract()
-
-        text = soup.get_text(separator="\n")
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        return "\n".join(lines[:2000])  # Limit to avoid token overflow
-
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "aside"]): tag.decompose()
+        main = soup.find('main')
+        article = soup.find('article')
+        div = soup.find('div')
+        text = ""
+        if main: text = main.get_text(separator="\n")
+        elif article: text = article.get_text(separator="\n")
+        elif div: text = div.get_text(separator="\n")
+        else: text = soup.get_text(separator="\n")
+        return "\n".join(line.strip() for line in text.splitlines() if line.strip())
     except Exception as e:
-        return f"Error fetching website: {e}"
+        return f"Error: {e}"
 
-def generate_answer(context, query):
-    """Generate an answer using Gemini based on context and user query."""
-    prompt = f"""
-You are a helpful web knowledge assistant.
+def chunk(text, n=256, overlap=32):
+    """Quick chunker."""
+    # Split text and filter out any empty chunk
+    raw_chunks = [text[i:i+n] for i in range(0, len(text), n-overlap)]
+    return [c for c in raw_chunks if c.strip()]
 
-Context from the website:
-{context}
+def make_index(chunks, embedder):
+    if not chunks:
+        raise ValueError("No valid (non-empty) chunks to index.")
+    embeddings = embedder.encode(chunks)
+    embeddings = np.array(embeddings).astype('float32')
+    if len(embeddings.shape) != 2 or embeddings.shape[0] == 0 or embeddings.shape[1] == 0:
+        raise ValueError(f"Embeddings array has invalid shape: {embeddings.shape}")
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index
 
-Question:
-{query}
+def get_top_chunks(question, index, chunks, embedder, k=2):
+    q_emb = embedder.encode([question]).astype('float32')
+    _, idxs = index.search(q_emb, k)
+    return [chunks[i] for i in idxs[0]]
 
-Answer in a concise and accurate way based on the above context.
-If the answer is not found in context, clearly say "I couldn’t find that information on this site."
-"""
+def get_answer(context, question):
+    prompt = f"Context:\n{context}\n\nQuestion:\n{question}\n\nAnswer concisely based on context."
     try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"⚠️ Error generating answer: {e}"
+        res = model.generate_content(prompt)
+        return res.text.strip()
+    except Exception as ex:
+        return f"Error: {ex}"
 
-# -------------------------------
-# 3. Streamlit UI
-# -------------------------------
-st.title("🌐 Website Knowledge RAG Assistant (Gemini 2.5 Flash Lite)")
-st.markdown("Enter a website URL to crawl and then ask questions based on its content.")
+st.set_page_config(page_title="RAG Chatbot", layout="wide")
+st.title("🌐 Website RAG Chatbot")
 
-# Input section
-url = st.text_input("🔗 Enter Website URL:")
-fetch_button = st.button("📥 Fetch Website Content")
+if "msgs" not in st.session_state: st.session_state.msgs = []
 
-if fetch_button and url:
-    with st.spinner("Fetching website content..."):
-        context = crawl_website(url)
-        st.session_state["context"] = context
-    st.success("✅ Website content fetched successfully!")
-    st.text_area("Website Content (First 2000 chars):", context[:2000], height=200)
+with st.sidebar:
+    url = st.text_input("Enter Website URL:", placeholder="https://example.com")
+    if st.button("🔄 Fetch & Index", use_container_width=True):
+        if url:
+            with st.spinner("Fetching website..."):
+                page = fast_crawl(url)
+                if page.startswith("Error:"):
+                    st.error(page)
+                else:
+                    chunks = chunk(page, n=256, overlap=32)
+                    chunks = [c for c in chunks if c.strip()]  # Extra filter, just in case
+                    if not chunks:
+                        st.error("No usable content found on this website.")
+                    else:
+                        try:
+                            index = make_index(chunks, embedding_model)
+                            st.session_state.index = index
+                            st.session_state.chunks = chunks
+                            st.session_state.msgs = []
+                            st.session_state.url = url
+                        except Exception as ex:
+                            st.error(f"Indexing failed: {ex}")
+        else:
+            st.warning("Enter a URL first.")
 
-# Question input
-if "context" in st.session_state:
-    query = st.text_input("❓ Ask a question about the website content:")
-    if st.button("💬 Get Answer"):
-        with st.spinner("Generating answer..."):
-            answer = generate_answer(st.session_state["context"], query)
-        st.markdown("### 🧠 Answer:")
-        st.write(answer)
+if "index" in st.session_state:
+    st.subheader("💬 Chat")
+    for msg in st.session_state.msgs:
+        who, text = msg["role"], msg["content"]
+        with st.chat_message(who): st.write(text)
+    in_col, btn_col = st.columns([5,1])
+    with in_col:
+        q = st.text_input("Ask a question:", "", key="chat_input")
+    with btn_col:
+        if st.button("Send", use_container_width=True) and q.strip():
+            st.session_state.msgs.append({"role": "user", "content": q})
+            with st.chat_message("user"): st.write(q)
+            with st.spinner("Thinking..."):
+                context = "\n\n".join(get_top_chunks(q, st.session_state.index, st.session_state.chunks, embedding_model))
+                ans = get_answer(context, q)
+            st.session_state.msgs.append({"role": "assistant", "content": ans})
+            with st.chat_message("assistant"): st.write(ans)
+            st.rerun()
+else:
+    st.info("👉 Fetch a website in the sidebar first to use the chat.")
